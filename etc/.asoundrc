@@ -1,0 +1,39 @@
+# This ALSA configuration file creates an 8 channel, 32-bit, 48kHz
+# full duplex stream using the snd-aloop module
+#
+# Note that the snd-aloop needs to be installed/compiled into your
+# kernel for this to work. If it exists, you can load the module with
+# modprobe snd-aloop.
+
+
+# Set up output device
+pcm.loophw00 {
+  type hw
+  card Loopback
+  device 0
+  subdevice 0
+  format S32_LE
+  rate 48000
+  channels 8
+}
+
+# Set up input device
+pcm.loophw01 {
+  type hw
+  card Loopback
+  device 1
+  subdevice 0
+  format S32_LE
+  rate 48000
+  channels 8
+}
+
+pcm.aduplex {
+  type asym
+  playback.pcm "loophw00"
+  capture.pcm "loophw01"
+  hint {
+       show on
+       description "Duplex Loopback"
+  }
+}
