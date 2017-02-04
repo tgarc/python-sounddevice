@@ -1,17 +1,7 @@
 #!/usr/bin/env python
 """
-Uses the `soundfile <http://pysoundfile.readthedocs.io>`_ and `sounddevice
-<http://python-sounddevice.readthedocs.io>`_ libraries to playback, record, or
-simultaneously playback and record audio files.
-
-Notes::
-
-  + 24-bit streaming is currently not supported (typically 32-bit streaming gets
-    downconverted automatically anyway)
-
-  + For simplicity, this app only supports 'symmetric' full duplex audio streams;
-    i.e., the input device and output device are assumed to be the same.
-
+A few utility function and classes to simplify playing back and reading audio
+streams.
 """
 from __future__ import print_function
 try:
@@ -31,9 +21,34 @@ import traceback
 
 
 TXQSIZE = 1<<16 # Number of frames to buffer for transmission
-_dtype2ctype = {'int32': 'int', 'int24': 'int', 'int16': 'short', 'float32': 'float'}
 
+
+# TODO
+# Replace Queue with a portaudio ring buffer in order to allow variable block
+# sizes
 class QueuedStreamBase(sd._StreamBase):
+    """
+    This class adds a python Queue for reading and writing audio data. This
+    double buffers the audio data so that any processing is kept out of the time
+    sensitive audio callback function. For maximum flexibility, receive queue
+    data is a bytearray object; transmit queue data should be of a buffer type
+    where each element is a single byte.
+
+    Notes:
+    
+    Using a queue requires that we use a fixed, predetermined value for the
+    portaudio blocksize.
+
+    If the receive buffer fills or the transmit buffer is found empty during a
+    callback the audio stream is aborted and an exception is raised.
+
+    During recording, the end of the stream is signaled by a 'None' value placed
+    into the receive queue.
+
+    During playback, the end of the stream is signaled by an item on the queue
+    that is smaller than blocksize*channels*samplesize bytes.
+
+    """
     def __init__(self, blocksize=None, qsize=-1, kind='duplex', **kwargs):
         if kwargs.get('callback', None) is None: 
             if kind == 'input':
@@ -81,12 +96,11 @@ class QueuedStreamBase(sd._StreamBase):
             self._set_exception(sd.PortAudioError(str(status)))
             raise sd.CallbackAbort
 
-        if not status.priming_output:
-            try:
-                self.rxq.put_nowait(bytearray(in_data))
-            except queue.Full:
-                self._set_exception(queue.Full("Receive queue is full."))
-                raise sd.CallbackAbort
+        try:
+            self.rxq.put_nowait(bytearray(in_data))
+        except queue.Full:
+            self._set_exception(queue.Full("Receive queue is full."))
+            raise sd.CallbackAbort
 
         self.frame_count += frame_count
 
@@ -171,6 +185,19 @@ class QueuedStreamBase(sd._StreamBase):
                 "channels={1._channels}, dtype={1._dtype!r}, blocksize={1._blocksize})").format(self.__class__.__name__, self)
 
 class ThreadedStreamBase(QueuedStreamBase):
+    """
+    This class builds on the QueuedStream class by adding the ability to
+    register functions for reading (qreader) and writing (qwriter) audio data
+    which run in their own threads. However, the qreader and qwriter threads are
+    optional; this allows the use of a 'duplex' stream which e.g. has a
+    dedicated thread for writing data but for which data is read in the main
+    thread.
+
+    An important advantage with this class is that it properly handles any
+    exceptions raised in the qreader and qwriter threads. Specifcally, if an
+    exception is raised, the stream will be aborted and the exception re-raised
+    in the main thread.
+    """
     def __init__(self, blocksize=None, qreader=None, qwriter=None, kind='duplex', **kwargs):
         super(ThreadedStreamBase, self).__init__(kind=kind, blocksize=blocksize, **kwargs)
 
@@ -198,8 +225,11 @@ class ThreadedStreamBase(QueuedStreamBase):
         exc = self._exc.get()
         if isinstance(exc, tuple):
             exctype, excval, exctb = exc
-            raise exctype, excval, exctb
-            # raise exctype(excval).with_traceback(exctb)
+            # raise exctype, excval, exctb
+            try:
+                raise exctype(excval).with_traceback(exctb)
+            except AttributeError:
+                raise exctype(excval)
 
         raise exc
 
@@ -212,6 +242,10 @@ class ThreadedStreamBase(QueuedStreamBase):
         self._exc.put(exc)
 
     def _qrwwrapper(self, queue, qrwfunc):
+        """
+        Wrapper function for the qreader and qwriter threads which acts as a
+        kind of context manager.
+        """
         try:                
             qrwfunc(self, queue)
         except:        
@@ -278,23 +312,26 @@ def _soundfilereader(stream, txq):
         framesize = stream.framesize
         dtype = stream.dtype    
 
-    ctype = _dtype2ctype[dtype]
-
     buff = bytearray(stream.fileblocksize*framesize)
     while not stream._exit.is_set():
-        nframes = stream.inp_fh.buffer_read_into(buff, ctype)
-
-        if nframes < stream.blocksize:
-            if stream.loop == 0:
-                stream._exit.set()
-            else:
-                stream.loop -= 1
-                stream.inp_fh.seek(0)
-                nframes += stream.inp_fh.buffer_read_into(buff[nframes*framesize:], ctype)
+        nframes = stream.inp_fh.buffer_read_into(buff, dtype=dtype)
 
         txq.put(bytearray(buff[:nframes*framesize]))
 
+        if nframes < stream.blocksize:
+            break
+
 class SoundFileStreamBase(ThreadedStreamBase):
+    """
+    This helper class basically gives you two things: 
+
+        1) it provides complete qreader and qwriter functions for SoundFile
+           objects (or anything that can be opened as a SoundFile object)
+
+        2) it automatically sets parameters for the stream based on the input
+           file and automatically sets parameters for the output file based on
+           the output stream.
+    """
     def __init__(self, inpf=None, outf=None, fileblocksize=None, qreader=None, qwriter=None, kind='duplex', **kwargs):
         # We're playing an audio file, so we can safely assume there's no need
         # to clip
@@ -370,43 +407,31 @@ class SoundFileInputStream(SoundFileStreamBase):
         super(SoundFileInputStream, self).__init__(outf=outf, kind='input', **kwargs)
 
 class SoundFileOutputStream(SoundFileStreamBase):
-    def __init__(self, inpf, loop=False, qsize=TXQSIZE, fileblocksize=None, **kwargs):
-        loop = -1 if loop is True else int(loop)
-
-        if loop < 0 and qsize <= 0:
-            raise ValueError("Must choose a positive finite qsize for infinite loop mode.")
-
+    def __init__(self, inpf, qsize=TXQSIZE, fileblocksize=None, **kwargs):
         super(SoundFileOutputStream, self).__init__(inpf=inpf, qsize=qsize,
                                                     kind='output',
                                                     fileblocksize=fileblocksize,
                                                     **kwargs)
 
-        if loop!=0 and not self.inp_fh.seekable:
-            raise ValueError("Loop mode specified but input file is not seekable.")
-
-        self.loop = loop
-
 class SoundFileStream(SoundFileStreamBase):
-    def __init__(self, inpf=None, outf=None, loop=False, qsize=TXQSIZE, sfkwargs={}, fileblocksize=None, **kwargs):
+    """
+    Note that only one of inpf and outf is required. This allows you to e.g. use
+    a SoundFile as input but implement your own qreader and/or read from the
+    queue in the main thread.
+    """
+    def __init__(self, inpf=None, outf=None, qsize=TXQSIZE, sfkwargs={}, fileblocksize=None, **kwargs):
+        # If you're not using soundfiles for the input or the output, then you
+        # should probably be using the Queued or ThreadedStream class
         if inpf is None and outf is None: 
             raise ValueError("No input or output file given.")
-
-        loop = -1 if loop is True else int(loop)
-        if loop < 0 and qsize <= 0:
-            raise ValueError("Must choose a positive finite qsize for infinite loop mode.")
 
         super(SoundFileStream, self).__init__(inpf=inpf, outf=outf, qsize=qsize,
                                               fileblocksize=fileblocksize,
                                               kind='duplex', **kwargs)
 
-        if loop!=0 and not self.inp_fh.seekable:
-            raise ValueError("Loop mode specified but input file is not seekable.")
-
-        self.loop = loop
-
 def blockstream(inpf=None, blocksize=1024, overlap=0, always_2d=False, copy=False, **kwargs):
     import numpy as np
-    assert blocksize is not None and blocksize > 0
+    assert blocksize is not None and blocksize > 0, "Requires a fixed known blocksize"
 
     incframes = blocksize-overlap
     if inpf is None:
@@ -423,7 +448,7 @@ def blockstream(inpf=None, blocksize=1024, overlap=0, always_2d=False, copy=Fals
     if channels > 1:
         always_2d = True
 
-    outbuff = np.zeros((blocksize, channels) if always_2d else blocksize, dtype=dtype)
+    outbuff = np.zeros((blocksize, channels) if always_2d else blocksize*channels, dtype=dtype)
 
     with stream:
         while stream.active:

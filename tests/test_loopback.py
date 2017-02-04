@@ -140,18 +140,21 @@ class PortAudioLoopbackTester(object):
 
         rdm_fh.close()
 
-    def assert_stream_equal(self, inp_fh, **kwargs):
+    def assert_stream_equal(self, inp_fh, preamble, **kwargs):
         inpf2 = sf.SoundFile(inp_fh.name.name, mode='rb')    
+
+        delay = -1
         found_delay = False
         nframes = mframes = 0
         for outframes in utils.blockstream(inp_fh, **kwargs):
             if not found_delay:
-                if outframes.any(): 
+                matches = outframes[:, 0].view('u4') == preamble
+                if np.any(matches): 
                     found_delay = True
-                    nonzeros = np.where(outframes[:, 0])[0]
+                    nonzeros = np.where(matches)[0]
                     outframes = outframes[nonzeros[0]:]
-                    delay = nonzeros[0]
-
+                    nframes += nonzeros[0]
+                    delay = nframes
             if found_delay:
                 inframes = inpf2.read(len(outframes), dtype='int32', always_2d=True)
 
@@ -161,13 +164,16 @@ class PortAudioLoopbackTester(object):
 
                 npt.assert_array_equal(inp, out, "Loopback data mismatch")
                 mframes += mlen
-
             nframes += len(outframes)
 
-        print("Matched %d frames; Initial delay of %d frames" % (mframes, delay))
+        assert delay != -1, "Preamble not found on loopback"
+
+        print("Matched %d of %d frames; Initial delay of %d frames" % (mframes, nframes, delay))
 
 class TestALSALoopback(PortAudioLoopbackTester):
-    def test_wav24(self, tmpdir, randomwav84824):
-        tx_fh = randomwav84824
+    def test_wav32(self, tmpdir, randomwav84832):
+        tx_fh = randomwav84832
         tx_fh.seek(0)
-        self.assert_stream_equal(tx_fh, blocksize=512, dtype='int32', device='aduplex')
+        self.assert_stream_equal(tx_fh, PREAMBLE,
+                                 blocksize=512, dtype='int32',
+                                 device='aduplex')
