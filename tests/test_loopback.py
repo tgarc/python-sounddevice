@@ -9,171 +9,114 @@ import pytest
 import numpy.testing as npt
 import time
 import tempfile
+import platform
 try:
     import Queue as queue
 except ImportError:
     import queue
 import utils
 
-BLOCKSIZE = 2048
-TEST_LENGTHS = [5]
-PREAMBLE = 0x7FFFFFFF
 
+# Set up the platform specific device
+system = platform.system()
+if system == 'Windows':
+    DEVICE_KWARGS = {'device': 'ASIO4ALL v2, ASIO', 'dtype': 'int24', 'blocksize': 512, 'channels': 8, 'samplerate':48000}
+elif system == 'Darwin':
+    raise Exception("Currently no support for Mac devices")
+else:
+    # This is assuming you're using the ALSA device set up by etc/.asoundrc
+    DEVICE_KWARGS = {'device': 'aduplex', 'dtype': 'int32', 'blocksize': 512, 'channels': 8, 'samplerate':48000}
+
+if 'SOUNDDEVICE_DEVICE_NAME' in os.environ:
+    DEVICE_KWARGS['device'] = os.environ['SOUNDDEVICE_DEVICE_NAME']
+if 'SOUNDDEVICE_DEVICE_BLOCKSIZE' in os.environ:
+    DEVICE_KWARGS['blocksize'] = os.environ['SOUNDDEVICE_DEVICE_BLOCKSIZE']
+if 'SOUNDDEVICE_DEVICE_DTYPE' in os.environ:
+    DEVICE_KWARGS['dtype'] = os.environ['SOUNDDEVICE_DEVICE_DTYPE']
+if 'SOUNDDEVICE_DEVICE_CHANNELS' in os.environ:
+    DEVICE_KWARGS['channels'] = os.environ['SOUNDDEVICE_DEVICE_CHANNELS']
+if 'SOUNDDEVICE_DEVICE_SAMPLERATE' in os.environ:
+    DEVICE_KWARGS['SAMPLERATE'] = os.environ['SOUNDDEVICE_DEVICE_SAMPLERATE']
+
+PREAMBLE = 0x7FFFFFFF # Value used for the preamble sequence (before appropriate shifting for dtype)
+
+_dtype2elementsize = dict(int32=4,int24=3,int16=2,int8=1)
 vhex = np.vectorize('{:#10x}'.format)
 tohex = lambda x: vhex(x.view('u4'))
 
+def assert_loopback_equal(inp_fh, preamble, **kwargs):
+    inpf2 = sf.SoundFile(inp_fh.name, mode='rb')
 
-def sf_find_delay(xf, mask=0xFFFF0000, chan=None):
-    pos = xf.tell()
+    devargs = dict(DEVICE_KWARGS)
+    devargs.update(kwargs)
 
-    off = -1
-    inpblocks = xf.blocks(BLOCKSIZE, dtype='int32')
-    for i,inpblk in enumerate(inpblocks):
-        nonzeros = np.where(inpblk[:, chan]&mask)
-        if nonzeros[0].any(): 
-            off = i*BLOCKSIZE + nonzeros[0][0]
-            break
-
-    xf.seek(pos)
-
-    return off
-
-def sf_assert_equal(tx_fh, rx_fh, mask=0xFFFF0000, chi=None, chf=None, allow_truncation=False, allow_delay=False):
-    d = sf_find_delay(rx_fh, mask=mask, chan=chi)
+    delay = -1
+    found_delay = False
+    nframes = mframes = 0
     
-    assert d != -1, "Test Preamble pattern not found"
+    for outframes in utils.blockstream(inp_fh, **devargs):
+        if not found_delay:
+            matches = outframes[:, 0].view('u4') == preamble
+            if np.any(matches): 
+                found_delay = True
+                nonzeros = np.where(matches)[0]
+                outframes = outframes[nonzeros[0]:]
+                nframes += nonzeros[0]
+                delay = nframes
+        if found_delay:
+            inframes = inpf2.read(len(outframes), dtype='int32', always_2d=True)
 
-    if not allow_delay:
-        assert d == 0, "Signal delayed by %d frames" % d
-    rx_fh.seek(d)
-    
-    inpblocks = tx_fh.blocks(BLOCKSIZE, dtype='int32')
-    for inpblk in inpblocks:
-        outblk = rx_fh.read(BLOCKSIZE, dtype='int32')
+            mlen = min(len(inframes), len(outframes))
+            inp = inframes[:mlen].view('u4')
+            out = outframes[:mlen].view('u4')
 
-        if not allow_truncation:
-            assert len(inpblk) == len(outblk), "Some samples were dropped"
+            npt.assert_array_equal(inp, out, "Loopback data mismatch")
+            mframes += mlen
+        nframes += len(outframes)
 
-        mlen = min(len(inpblk), len(outblk))
-        inp = (inpblk[:mlen,chi:chf].view('u4'))&mask
-        out = outblk[:mlen,chi:chf].view('u4')&mask
+    assert delay != -1, "Preamble not found or was corrupted"
 
-        npt.assert_array_equal(inp, out, "Loopback data mismatch")
-
+    print("Matched %d of %d frames; Initial delay of %d frames" % (mframes, nframes, delay))
 
 class PortAudioLoopbackTester(object):
-    def _gen_random(self, rdm_fh, nrepeats, nbytes):
-        shift = 8*(4-nbytes)
+    def _gen_random(self, rdm_fh, nseconds, elementsize):
+        """
+        Generates a uniformly random integer signal ranging between the
+        minimum and maximum possible values as defined by `elementsize`. The random
+        signal is preceded by a constant level equal to the maximum positive
+        integer value for 100ms or N=sampling_rate/10 samples (the 'preamble')
+        which can be used in testing to find the beginning of a recording.
+
+        nseconds - how many seconds of data to generate
+        elementsize - size of each element (single sample of a single frame) in bytes
+        """
+        shift = 8*(4-elementsize)
         minval = -(0x80000000>>shift)
         maxval = 0x7FFFFFFF>>shift
 
         preamble = np.zeros((rdm_fh.samplerate//10, rdm_fh.channels), dtype=np.int32)
-        preamble[:] = maxval << shift
+        preamble[:] = (PREAMBLE >> shift) << shift
         rdm_fh.write(preamble)
 
-        for i in range(nrepeats):
+        for i in range(nseconds):
             pattern = np.random.randint(minval, maxval+1, (rdm_fh.samplerate, rdm_fh.channels)) << shift
             rdm_fh.write(pattern.astype(np.int32))
 
-    @pytest.fixture(scope='session', params=TEST_LENGTHS)
-    def randomwav84832(self, request, tmpdir_factory):
-        tmpdir = tmpdir_factory.getbasetemp()
-        rdmf = tempfile.NamedTemporaryFile('w+b', dir=str(tmpdir))
+class TestDummyLoopback(PortAudioLoopbackTester):
+    def test_wav(self, tmpdir):
+        elementsize = _dtype2elementsize[DEVICE_KWARGS['dtype']]
 
-        rdm_fh = sf.SoundFile(rdmf, 'w+', 48000, 8, 'PCM_32', format='wav')
-        self._gen_random(rdm_fh, request.param, 4)
+        rdmf = tempfile.mktemp(dir=str(tmpdir))
+        rdm_fh = sf.SoundFile(rdmf, 'w+', DEVICE_KWARGS['samplerate'], DEVICE_KWARGS['channels'], 'PCM_'+['8', '16','24','32'][elementsize-1], format='wav')
+
+        self._gen_random(rdm_fh, 5, elementsize)
         rdm_fh.seek(0)
 
-        yield rdm_fh
+        dtype = DEVICE_KWARGS['dtype']
+        if DEVICE_KWARGS['dtype'] == 'int24': 
+            # Tell the OS it's a 32-bit stream and ignore the extra zeros
+            # because 24 bit streams are annoying to deal with
+            dtype = 'int32' 
 
-        rdm_fh.close()
-
-    @pytest.fixture(scope='session', params=TEST_LENGTHS)
-    def randomwav84824(self, request, tmpdir_factory):
-        tmpdir = tmpdir_factory.getbasetemp()
-        rdmf = tempfile.NamedTemporaryFile('w+b', dir=str(tmpdir))
-
-        rdm_fh = sf.SoundFile(rdmf, 'w+', 48000, 8, 'PCM_24', format='wav')
-        self._gen_random(rdm_fh, request.param, 3)
-        rdm_fh.seek(0)
-
-        yield rdm_fh
-
-        rdm_fh.close()
-
-    @pytest.fixture(scope='session', params=TEST_LENGTHS)
-    def randomwav84816(self, request, tmpdir_factory):
-        tmpdir = tmpdir_factory.getbasetemp()
-        rdmf = tempfile.NamedTemporaryFile('w+b', dir=str(tmpdir))
-
-        rdm_fh = sf.SoundFile(rdmf, 'w+', 48000, 8, 'PCM_16', format='wav')
-        self._gen_random(rdm_fh, request.param, 2)
-        rdm_fh.seek(0)
-
-        yield rdm_fh
-
-        rdm_fh.close()
-
-    @pytest.fixture(scope='session', params=TEST_LENGTHS)
-    def randomwav84432(self, request, tmpdir_factory):
-        tmpdir = tmpdir_factory.getbasetemp()
-        rdmf = tempfile.NamedTemporaryFile('w+b', dir=str(tmpdir))
-
-        rdm_fh = sf.SoundFile(rdmf, 'w+', 44100, 8, 'PCM_32', format='wav')
-        self._gen_random(rdm_fh, request.param, 4)
-        rdm_fh.seek(0)
-
-        yield rdm_fh
-
-        rdm_fh.close()
-
-    @pytest.fixture(scope='session', params=TEST_LENGTHS)
-    def randomwav84416(self, request, tmpdir_factory):
-        tmpdir = tmpdir_factory.getbasetemp()
-        rdmf = tempfile.NamedTemporaryFile('w+b', dir=str(tmpdir))
-
-        rdm_fh = sf.SoundFile(rdmf, 'w+', 44100, 8, 'PCM_16', format='wav')
-        self._gen_random(rdm_fh, request.param, 2)
-        rdm_fh.seek(0)
-
-        yield rdm_fh
-
-        rdm_fh.close()
-
-    def assert_stream_equal(self, inp_fh, preamble, **kwargs):
-        inpf2 = sf.SoundFile(inp_fh.name.name, mode='rb')    
-
-        delay = -1
-        found_delay = False
-        nframes = mframes = 0
-        for outframes in utils.blockstream(inp_fh, **kwargs):
-            if not found_delay:
-                matches = outframes[:, 0].view('u4') == preamble
-                if np.any(matches): 
-                    found_delay = True
-                    nonzeros = np.where(matches)[0]
-                    outframes = outframes[nonzeros[0]:]
-                    nframes += nonzeros[0]
-                    delay = nframes
-            if found_delay:
-                inframes = inpf2.read(len(outframes), dtype='int32', always_2d=True)
-
-                mlen = min(len(inframes), len(outframes))
-                inp = inframes[:mlen].view('u4')
-                out = outframes[:mlen].view('u4')
-
-                npt.assert_array_equal(inp, out, "Loopback data mismatch")
-                mframes += mlen
-            nframes += len(outframes)
-
-        assert delay != -1, "Preamble not found on loopback"
-
-        print("Matched %d of %d frames; Initial delay of %d frames" % (mframes, nframes, delay))
-
-class TestALSALoopback(PortAudioLoopbackTester):
-    def test_wav32(self, tmpdir, randomwav84832):
-        tx_fh = randomwav84832
-        tx_fh.seek(0)
-        self.assert_stream_equal(tx_fh, PREAMBLE,
-                                 blocksize=512, dtype='int32',
-                                 device='aduplex')
+        shift = 8*(4-elementsize)
+        assert_loopback_equal(rdm_fh, (PREAMBLE>>shift)<<shift, dtype=dtype)

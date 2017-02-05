@@ -148,6 +148,7 @@ class QueuedStreamBase(sd._StreamBase):
         # This is our last callback!
         if len(txbuff) < frame_count*self.framesize[1]:
             self.frame_count += len(txbuff)//self.framesize[1]
+            self.rxq.put(None)
             raise sd.CallbackStop
 
         self.frame_count += frame_count
@@ -318,7 +319,7 @@ def _soundfilereader(stream, txq):
 
         txq.put(bytearray(buff[:nframes*framesize]))
 
-        if nframes < stream.blocksize:
+        if nframes < stream.fileblocksize:
             break
 
 class SoundFileStreamBase(ThreadedStreamBase):
