@@ -148,7 +148,7 @@ class QueuedStreamBase(sd._StreamBase):
         # This is our last callback!
         if len(txbuff) < frame_count*self.framesize[1]:
             self.frame_count += len(txbuff)//self.framesize[1]
-            self.rxq.put(None)
+            self.rxq.put(None) # This actually gets done in closequeues but that method doesn't work in windows
             raise sd.CallbackStop
 
         self.frame_count += frame_count
@@ -226,10 +226,10 @@ class ThreadedStreamBase(QueuedStreamBase):
         exc = self._exc.get()
         if isinstance(exc, tuple):
             exctype, excval, exctb = exc
-            # raise exctype, excval, exctb
             try:
                 raise exctype(excval).with_traceback(exctb)
             except AttributeError:
+                traceback.print_tb(exctb)
                 raise exctype(excval)
 
         raise exc
@@ -333,7 +333,7 @@ class SoundFileStreamBase(ThreadedStreamBase):
            file and automatically sets parameters for the output file based on
            the output stream.
     """
-    def __init__(self, inpf=None, outf=None, fileblocksize=None, qreader=None, qwriter=None, kind='duplex', **kwargs):
+    def __init__(self, inpf=None, outf=None, fileblocksize=None, qreader=None, qwriter=None, kind='duplex', sfkwargs={}, **kwargs):
         # We're playing an audio file, so we can safely assume there's no need
         # to clip
         if kwargs.get('clip_off', None) is None: 
@@ -342,56 +342,62 @@ class SoundFileStreamBase(ThreadedStreamBase):
         if kwargs.get('blocksize', None) is None:
             kwargs['blocksize'] = fileblocksize
 
+        # At this point we don't care what 'kind' the stream is, only whether
+        # the input/output is None which determines whether qreader/qwriter
+        # functions should be registered
         self._inpf = inpf
-        if inpf is not None and not isinstance(inpf, sf.SoundFile):
-            inp_fh = sf.SoundFile(inpf)
-        else:
+        if inpf is not None:
             inp_fh = inpf
-
-        if isinstance(inp_fh, sf.SoundFile):
+            if not isinstance(inpf, sf.SoundFile):
+                inp_fh = sf.SoundFile(inpf)
             if kwargs.get('samplerate', None) is None: 
                 kwargs['samplerate'] = inp_fh.samplerate
             if kwargs.get('channels', None) is None: 
                 kwargs['channels'] = inp_fh.channels
             if qwriter is None:
                 qwriter = _soundfilereader
-        # elif inpf is not None and qwriter is None:
-        #     raise ValueError("If not using a SoundFile object for playback you must provide your own qwriter routine.")
+        else:
+            inp_fh = inpf
 
+        # We need to set the qreader here; output file parameters will known
+        # once we open the stream
         self._outf = outf
+        if outf is not None and qreader is None:
+            qreader = _soundfilewriter                
+            
+        super(SoundFileStreamBase, self).__init__(qreader=qreader,
+                                                  qwriter=qwriter, 
+                                                  kind=kind, **kwargs)
+
+        # Try and determine the file extension here; we need to know it if we
+        # want to try and set a default subtype for the output
         try:
             outext = getattr(outf, 'name', outf).rsplit('.', 1)[1].lower()
         except AttributeError:
             outext = None
-        if not isinstance(outf, sf.SoundFile) and outf is not None:
-            sfkwargs = kwargs['sfkwargs']
-            if isinstance(inp_fh, sf.SoundFile):
+
+        # If the output file hasn't already been opened, we open it here using
+        # the input file and output stream settings, plus any user supplied
+        # arguments
+        if outf is not None and not isinstance(outf, sf.SoundFile):
+            if inp_fh is not None:
                 if sfkwargs.get('endian', None) is None:
                     sfkwargs['endian'] = inp_fh.endian
                 if (sfkwargs.get('format', outext) == inp_fh.format.lower()
                     and sfkwargs.get('subtype', None) is None):
                     sfkwargs['subtype'] = inp_fh.subtype
             if sfkwargs.get('channels', None) is None: 
-                sfkwargs['channels'] = self.channels[0]
+                sfkwargs['channels'] = self.channels[0] if kind == 'duplex' else self.channels
             if sfkwargs.get('samplerate', None) is None:
                 sfkwargs['samplerate'] = int(self.samplerate)
             if sfkwargs.get('mode', None) is None:
                 sfkwargs['mode'] = 'w+b'
             out_fh = sf.SoundFile(outf, **sfkwargs)
-            if qreader is None:
-                qreader = _soundfilewriter                
         else:
             out_fh = outf
 
-        # if outf is not None and qreader is None:
-        #     raise ValueError("If not using a SoundFile object for recording you must provide your own qreader routine.")
-
-        super(SoundFileStreamBase, self).__init__(qreader=qreader,
-                                                  qwriter=qwriter, 
-                                                  kind=kind, **kwargs)
-
         self.inp_fh = inp_fh
-        self.out_fh = outf
+        self.out_fh = out_fh
         self.fileblocksize = fileblocksize or self.blocksize
 
     def close(self):
@@ -405,7 +411,7 @@ class SoundFileStreamBase(ThreadedStreamBase):
 
 class SoundFileInputStream(SoundFileStreamBase):
     def __init__(self, outf, sfkwargs={}, **kwargs):
-        super(SoundFileInputStream, self).__init__(outf=outf, kind='input', **kwargs)
+        super(SoundFileInputStream, self).__init__(outf=outf, kind='input', sfkwargs=sfkwargs, **kwargs)
 
 class SoundFileOutputStream(SoundFileStreamBase):
     def __init__(self, inpf, qsize=TXQSIZE, fileblocksize=None, **kwargs):
