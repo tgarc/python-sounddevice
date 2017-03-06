@@ -565,8 +565,10 @@ def stop(ignore_errors=True):
 
     """
     if _last_callback:
-        _last_callback.stream.close(ignore_errors)
-
+        try:
+            _last_callback.stream.stop()
+        finally:
+            _last_callback.stream.close(ignore_errors)
 
 def get_status():
     """Get info about over-/underflows in `play()`/`rec()`/`playrec()`.
@@ -1204,8 +1206,12 @@ class _StreamBase(object):
 
     def __exit__(self, *args):
         """Stop and close the stream when exiting a "with" statement."""
-        self.stop()
-        self.close()
+        try:
+            self.stop()
+        except:
+            self.close(ignore_errors=True)
+            raise
+        self.close(ignore_errors=False)
 
     def start(self):
         """Commence audio processing.
@@ -2754,9 +2760,9 @@ def _terminate():
 
 def _exit_handler():
     assert _initialized >= 0
+    stop()
     while _initialized:
         _terminate()
-
 
 def _ignore_stderr():
     """Try to forward PortAudio messages from stderr to /dev/null."""
