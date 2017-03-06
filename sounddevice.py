@@ -566,7 +566,11 @@ def stop(ignore_errors=True):
     """
     if _last_callback:
         try:
-            _last_callback.stream.stop()
+            try:
+                _last_callback.stream.stop()
+            except PortAudioError:
+                if not ignore_errors:
+                    raise
         finally:
             _last_callback.stream.close(ignore_errors)
 
