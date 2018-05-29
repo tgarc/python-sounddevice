@@ -572,7 +572,7 @@ def query_hostapis(index=None):
 
 
 def check_input_settings(device=None, channels=None, dtype=None,
-                         extra_settings=None, samplerate=None):
+                         extra_settings=None, samplerate=None, interleaved=None):
     """Check if given input device settings are supported.
 
     All parameters are optional, `default` settings are used for any
@@ -592,25 +592,27 @@ def check_input_settings(device=None, channels=None, dtype=None,
         See `default.extra_settings`.
     samplerate : float, optional
         Sampling frequency, see `default.samplerate`.
+    interleaved : bool, optional
+        Whether stream data should be in interleaved format or not.
 
     """
-    parameters, dtype, samplesize, samplerate = _get_stream_parameters(
+    parameters, dtype, samplesize, samplerate, interleaved = _get_stream_parameters(
         'input', device=device, channels=channels, dtype=dtype, latency=None,
-        extra_settings=extra_settings, samplerate=samplerate)
+        extra_settings=extra_settings, samplerate=samplerate, interleaved=interleaved)
     _check(_lib.Pa_IsFormatSupported(parameters, _ffi.NULL, samplerate))
 
 
 def check_output_settings(device=None, channels=None, dtype=None,
-                          extra_settings=None, samplerate=None):
+                          extra_settings=None, samplerate=None, interleaved=None):
     """Check if given output device settings are supported.
 
     Same as `check_input_settings()`, just for output device
     settings.
 
     """
-    parameters, dtype, samplesize, samplerate = _get_stream_parameters(
+    parameters, dtype, samplesize, samplerate, interleaved = _get_stream_parameters(
         'output', device=device, channels=channels, dtype=dtype, latency=None,
-        extra_settings=extra_settings, samplerate=samplerate)
+        extra_settings=extra_settings, samplerate=samplerate, interleaved=interleaved)
     _check(_lib.Pa_IsFormatSupported(_ffi.NULL, parameters, samplerate))
 
 
@@ -644,7 +646,7 @@ class _StreamBase(object):
                  callback=None, finished_callback=None, clip_off=None,
                  dither_off=None, never_drop_input=None,
                  prime_output_buffers_using_stream_callback=None,
-                 userdata=None, wrap_callback=None):
+                 userdata=None, wrap_callback=None, interleaved=None):
         assert kind in ('input', 'output', 'duplex')
         assert wrap_callback in ('array', 'buffer', None)
         if blocksize is None:
@@ -675,25 +677,27 @@ class _StreamBase(object):
             idtype, odtype = _split(dtype)
             ilatency, olatency = _split(latency)
             iextra, oextra = _split(extra_settings)
-            iparameters, idtype, isize, isamplerate = _get_stream_parameters(
+            iinterleaved, ointerleaved = _split(interleaved)
+            iparameters, idtype, isize, isamplerate, iinterleaved = _get_stream_parameters(
                 'input', idevice, ichannels, idtype, ilatency, iextra,
-                samplerate)
-            oparameters, odtype, osize, osamplerate = _get_stream_parameters(
+                samplerate, iinterleaved)
+            oparameters, odtype, osize, osamplerate, ointerleaved = _get_stream_parameters(
                 'output', odevice, ochannels, odtype, olatency, oextra,
-                samplerate)
+                samplerate, ointerleaved)
             self._dtype = idtype, odtype
             self._device = iparameters.device, oparameters.device
             self._channels = iparameters.channelCount, oparameters.channelCount
             self._samplesize = isize, osize
+            self._interleaved = iinterleaved, ointerleaved
             if isamplerate != osamplerate:
                 raise ValueError(
                     'Input and output device must have the same samplerate')
             else:
                 samplerate = isamplerate
         else:
-            parameters, self._dtype, self._samplesize, samplerate = \
+            parameters, self._dtype, self._samplesize, samplerate, self._interleaved = \
                 _get_stream_parameters(kind, device, channels, dtype, latency,
-                                       extra_settings, samplerate)
+                                       extra_settings, samplerate, interleaved)
             self._device = parameters.device
             self._channels = parameters.channelCount
             if kind == 'input':
@@ -855,6 +859,11 @@ class _StreamBase(object):
 
         """
         return self._dtype
+    
+    @property
+    def interleaved(self):
+        """Whether stream data is in interleaved format or not ."""
+        return self._interleaved
 
     @property
     def samplesize(self):
@@ -1854,12 +1863,12 @@ class _InputOutputPair(object):
 class default(object):
     """Get/set defaults for the *sounddevice* module.
 
-    The attributes `device`, `channels`, `dtype`, `latency` and
-    `extra_settings` accept single values which specify the given
-    property for both input and output.  However, if the property
-    differs between input and output, pairs of values can be used, where
-    the first value specifies the input and the second value specifies
-    the output.  All other attributes are always single values.
+    The attributes `device`, `channels`, `dtype`, `interleaved`, `latency` and
+    `extra_settings` accept single values which specify the given property for
+    both input and output.  However, if the property differs between input and
+    output, pairs of values can be used, where the first value specifies the
+    input and the second value specifies the output.  All other attributes are
+    always single values.
 
     Examples
     --------
@@ -1935,6 +1944,15 @@ class default(object):
     "ground".
 
     """
+    interleaved = True, True
+    """Decides whether stream data should be in interleaved format or not.
+
+    Some native APIs use non-interleaved buffers, particularly those that
+    support more than 2 channels. Additionally, many client applications use
+    non-interleaved buffers internally. In order to avoid adding unnecessary
+    overhead, PortAudio supports both interleaved and non-interleaved
+    buffering on all platforms.
+    """    
     latency = _default_latency = 'high', 'high'
     """Suggested input/output latency in seconds.
 
@@ -2272,6 +2290,7 @@ class WasapiSettings(object):
         flags = 0x0
         if exclusive:
             flags |= _lib.paWinWasapiExclusive
+
         self._streaminfo = _ffi.new('PaWasapiStreamInfo*', dict(
             size=_ffi.sizeof('PaWasapiStreamInfo'),
             hostApiType=_lib.paWASAPI,
@@ -2469,7 +2488,7 @@ def _check_dtype(dtype):
 
 
 def _get_stream_parameters(kind, device, channels, dtype, latency,
-                           extra_settings, samplerate):
+                           extra_settings, samplerate, interleaved):
     """Get parameters for one direction (input or output) of a stream."""
     assert kind in ('input', 'output')
     if device is None:
@@ -2484,6 +2503,8 @@ def _get_stream_parameters(kind, device, channels, dtype, latency,
         extra_settings = default.extra_settings[kind]
     if samplerate is None:
         samplerate = default.samplerate
+    if interleaved is None:
+        interleaved = default.interleaved
 
     device = _get_device_id(device, kind, raise_on_error=True)
     info = query_devices(device)
@@ -2503,10 +2524,12 @@ def _get_stream_parameters(kind, device, channels, dtype, latency,
         latency = info['default_' + latency + '_' + kind + '_latency']
     if samplerate is None:
         samplerate = info['default_samplerate']
+    if not interleaved:
+        sampleformat |= _lib.paNonInterleaved
     parameters = _ffi.new('PaStreamParameters*', (
         device, channels, sampleformat, latency,
         extra_settings._streaminfo if extra_settings else _ffi.NULL))
-    return parameters, dtype, samplesize, samplerate
+    return parameters, dtype, samplesize, samplerate, interleaved
 
 
 def _wrap_callback(callback, *args):
